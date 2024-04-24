@@ -6,7 +6,9 @@ from airflow.operators.python_operator import PythonOperator
 from cloudera.airflow.providers.operators.cde import CdeRunJobOperator
 from airflow.providers.common.sql.operators.sql import ( 
 	BranchSQLOperator,
+	SQLIntervalCheckOperator,
 	SQLColumnCheckOperator, 
+	SQLThresholdCheckOperator,
 	SQLTableCheckOperator, 
 	SQLCheckOperator,
 	SQLValueCheckOperator,
@@ -36,7 +38,45 @@ dag = DAG(
 
 _CONN_ID="cdw-impala"
 
-cdw_check_quotation_mark = """
+sql_check_iata_length = """
+select
+      count(*) as failures,
+      count(*) != 0 as should_warn,
+      count(*) != 0 as should_error
+from (
+      with validation as (
+                    select iata as field
+                      from airflow_sql.airports
+                         ),
+                         validation_errors as (
+	   select field from validation
+	    where LENGTH(field) != 3
+                        )
+select *
+from validation_errors
+) iata_length_test;
+"""
+check_iata_length = BranchSQLOperator(
+    task_id="check-iata-length",
+    conn_id=_CONN_ID,
+    follow_task_ids_if_false=['check-quotation-mark'],
+    follow_task_ids_if_true=['clean-iata-length'],
+    sql=sql_check_iata_length,
+    dag=dag,
+)
+
+sql_clean_iata_length = """
+delete from airflow_sql.airports
+	where LENGTH(iata) != 3;
+"""
+clean_iata_length = SQLExecuteQueryOperator(
+    task_id="clean-iata-length",
+    conn_id=_CONN_ID,
+    sql=sql_clean_iata_length,
+    dag=dag,
+)
+
+sql_check_quotation_mark = """
 select
       count(*) as failures
     from (
@@ -53,91 +93,104 @@ from validation_errors
 ) quotation_marks_test;
 """
 
-dw_check_quotation_mark = BranchSQLOperator(
-    task_id="dataset-check-quotation_mark",
+check_quotation_mark = BranchSQLOperator(
+    task_id="check-quotation-mark",
     conn_id=_CONN_ID,
-    follow_task_ids_if_false=['dataset-check-num-rows'],
-    follow_task_ids_if_true=['dataset-qa-quotation_mark'],
-    sql=cdw_check_quotation_mark,
+    follow_task_ids_if_false=['check-num-rows'],
+    follow_task_ids_if_true=['clean-quotation-mark'],
+    sql=sql_check_quotation_mark,
     dag=dag,
 )
 
-cdw_qa_quotation_mark = """
+sql_clean_quotation_mark = """
 update airflow_sql.airports
 set airport = regexp_replace( airport ,'"','')
 where airport rlike('"');
 """
-dw_qa_quotation_mark = SQLExecuteQueryOperator(
-    task_id="dataset-qa-quotation_mark",
+clean_quotation_mark = SQLExecuteQueryOperator(
+    task_id="clean-quotation-mark",
     conn_id=_CONN_ID,
-    sql=cdw_qa_quotation_mark,
+    sql=sql_clean_quotation_mark,
     dag=dag,
 )
 
-cdw_check_num_rows = """
-select count(1) as num_rows from airlinedata.airports_ice;
+sql_check_num_rows = """
+select count(1) as num_rows from airflow_sql.airports;
 """
 
-dw_check_num_rows = SQLCheckOperator(
-    task_id="dataset-check-num-rows",
+check_num_rows = SQLCheckOperator(
+    task_id="check-num-rows",
     conn_id=_CONN_ID,
-    sql=cdw_check_num_rows,
+    sql=sql_check_num_rows,
     trigger_rule="none_failed",
     dag=dag,
 )
 
-cdw_create_1 = """
+# Define the SQL query to retrieve the value to be checked
+sql_value_check = """
+SELECT COUNT(*) AS record_count
+FROM airflow_sql.airports;
+"""
+
+# Define the SQLValueCheckOperator to perform the value check
+value_check = SQLValueCheckOperator(
+    task_id='value-check',
+    conn_id=_CONN_ID,  # Airflow connection ID for the database
+    sql=sql_value_check,
+    pass_value=3500,  # Expected value threshold
+    tolerance=0.2,
+    dag=dag,
+)
+
+threshold_check = SQLThresholdCheckOperator(
+    task_id="threshold-check",
+    conn_id=_CONN_ID,
+    sql=sql_value_check,
+    min_threshold=3000,
+    max_threshold=4000,
+    dag=dag,
+    )
+
+sql_create_dataset = """
 drop table if exists airflow_sql.airports;
 create table airflow_sql.airports
+ stored by iceberg TBLPROPERTIES('format-version'='2')
 as
  select * from airlinedata.airports_csv;
 """
 
-cdw_create = """
--- Query 1: Create a temporary table
-CREATE TEMPORARY TABLE temp_table AS
-SELECT *
-FROM airlinedata.airports_csv;
-
--- Query 2: Perform data transformation
-INSERT INTO target_table * 
-SELECT *
-FROM temp_table;
-
--- Query 3: Clean up temporary table
-DROP TABLE IF EXISTS temp_table;
-"""
-
-dw_create = SQLExecuteQueryOperator(
-    task_id="dataset-create-cdw",
+create_dataset = SQLExecuteQueryOperator(
+    task_id="create-dataset",
     conn_id=_CONN_ID,
-    sql=cdw_create,
+    sql=sql_create_dataset,
     split_statements=True,
     return_last=False,
     dag=dag,
 )
 
-cdw_query = """
+sql_query_sample = """
 select * from airflow_sql.airports limit 10;
 """
 
-dw_query = SQLExecuteQueryOperator(
+query_sample = SQLExecuteQueryOperator(
     task_id="dataset-query-cdw",
     conn_id=_CONN_ID,
-    sql=cdw_query,
+    sql=sql_query_sample,
     dag=dag,
     show_return_value_in_logs=True
 )
-dw_cursor = SQLExecuteQueryOperator(
+
+cursor_sample = SQLExecuteQueryOperator(
     task_id="dataset-cursor-cdw",
     conn_id=_CONN_ID,
-    sql=cdw_query,
+    sql=sql_query_sample,
     dag=dag,
     show_return_value_in_logs=True,
     handler=process_query_results
 )
-dw_column_checks = SQLColumnCheckOperator(
-        task_id="dw_column_checks",
+
+column_check = SQLColumnCheckOperator(
+        task_id="column-check",
         dag = dag,
         conn_id=_CONN_ID,
         table="airflow_sql.airports",
@@ -150,8 +203,8 @@ dw_column_checks = SQLColumnCheckOperator(
         },
     )
 
-dw_table_checks = SQLTableCheckOperator(
-        task_id="dw_table_checks",
+table_row_count_check = SQLTableCheckOperator(
+        task_id="table-row-count-check",
         dag = dag,
         conn_id=_CONN_ID,
         table="airflow_sql.airports",
@@ -161,4 +214,4 @@ dw_table_checks = SQLTableCheckOperator(
     )
 
 
-dw_create >> dw_table_checks >>  dw_check_num_rows >> dw_check_quotation_mark >> dw_qa_quotation_mark >>  dw_column_checks >>  dw_query >> dw_cursor 
+create_dataset >> table_row_count_check >>  check_num_rows >> value_check >> threshold_check >> column_check >> check_iata_length >> clean_iata_length >> check_quotation_mark >> clean_quotation_mark >> query_sample >> cursor_sample
